@@ -1,3 +1,4 @@
 data
 assembly_data_collection.ipynb
 .ipynb_checkpoints
+__pycache__

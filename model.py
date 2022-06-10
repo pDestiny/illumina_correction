@@ -1,167 +1,130 @@
 import torch
 import torch.nn as nn
-from decoder import InputEmbeddings, Transformer
+
 from voca import VOCA
+from argparse import ArgumentParser
+
+import pytorch_lightning as pl
+
+from encoder import TransformerEncoderLayer
 
 from torchmetrics import functional as FM
 
-class Transformer_DNA_prediction(pl.LightningModule):
-    def __init__(self,
-                 num_layers,  # number of layers
-                 d_model,  # dim. in attemtion mechanism
-                 num_heads,
-                 output_dim=4,
-                 # optiimzer setting
-                 learning_rate=1e-3):
 
-        super(Transformer_DNA_prediction, self).__init__()
+class IlluminaSequenceCorrector(pl.LightningModule):
+    def __init__(self,
+                 # network setting
+                 input_voca_size,
+                 output_vocab_size,
+                 d_model,  # dim. in attention mechanism
+                 num_heads,  # number of heads
+                 num_layers,
+                 learning_rate=1e-4):
+        super(IlluminaSequenceCorrector, self).__init__()
         self.save_hyperparameters()
 
-        ## embeddings for encoder and decoder (not shared so far)
-        self.emb = InputEmbeddings(
-            vocab_size=len(VOCA) - 1,
-            hidden_size=self.hparams.d_model,
-            layer_norm_eps=1e-12,
-            pad_token_id=VOCA.inverse["<PRE>"],
-            hidden_dropout_prob=0.1
-        )
+        # symbol_number_character to vector_number
+        self.input_emb = nn.Embedding(self.hparams.input_vocab_size,
+                                      self.hparams.d_model,
+                                      padding_idx=self.hparams.padding_idx)
 
-        ## Transformer Block
-        self.transformer = Transformer(
-            num_layers=self.hparams.num_layers,
-            d_model=self.hparams.d_model,
-            num_heads=self.hparams.num_heads,
-            dropout=0.1,
-            dim_feedforward=4 * self.hparams.d_model
-        )
+        # Now, we use transformer-encoder for encoding
+        #   - multiple items and a query item together
+        encoders = {}
+        for i in range(self.hparams.num_layers):
+            encoders[f"enc-{i + 1}"] =\
+                TransformerEncoderLayer(
+                    self.hparams.d_model,
+                    self.hparams.num_heads,
+                    dim_feedforward=self.hparams.d_model * 4,  # by convention
+                    dropout=0.1
+                )
 
-        ## to output class
-        self.to_output = nn.Linear(self.hparams.d_model, self.hparams.output_dim)  # D -> a single number
+        self.encoder = nn.Sequential(encoders)
+
+        # [to output]
+        self.to_output = nn.Linear(self.hparams.d_model, self.hparams.output_vocab_size)  # D -> a single number
 
         # loss
         self.criterion = nn.CrossEntropyLoss()
 
-
-    def forward(self, data):
-        enc_input_id, enc_input_mask, dec_input_id, label = data
-        # ----------------------- ENCODING -------------------------------#
+    def forward(self, seq_ids, weight):
+        # INPUT EMBEDDING
         # [ Digit Character Embedding ]
-        #   for encoder and decoder
-        enc_input = self.emb(enc_input_id.long())
-        dec_input = self.emb(dec_input_id.long())
+        # seq_ids : [B, max_seq_len]
+        seq_embs = self.input_emb(seq_ids.long())  # [B, max_seq_len, d_model]
 
-        enc_output, dec_output, _, _, _ = self.transformer(enc_input, dec_input, enc_input_mask)
+        # ENCODING BY Transformer-Encoder
+        # [mask shaping]
+        # masking - shape change
+        #   mask always applied to the last dimension explicitly.
+        #   so, we need to prepare good shape of mask
+        #   to prepare [B, dummy_for_heads, dummy_for_query, dim_for_key_dimension]
+        mask = weight[:, None, None, :]  # [B, 1, 1, max_seq_len]
+        seq_encs, attention_scores = self.encoder(seq_embs, mask)  # [B, max_seq_len, d_model]
 
-        # to symbol
-        step_logits = self.to_output(dec_output)  # [B, tar_seq_len, num_output_vocab]
+        # seq_encs         : [B, max_seq_len, d_model]
+        # attention_scores : [B, max_seq_len_query, max_seq_len_key]
 
-        return step_logits
+        # Output Processing
+        # pooling
+        blendded_vector = seq_encs[:, 0]  # taking the first(query) - step hidden state
+
+        # To output
+        logits = self.to_output(blendded_vector)
+        return logits, attention_scores
 
     def training_step(self, batch, batch_idx):
-        enc_input_ids, enc_input_pad_mask, \
-        dec_input_ids, \
-        dec_output_ids = batch
-
-        step_logits, _ = self([enc_input_ids, dec_input_ids, enc_input_pad_mask])
-        C = step_logits.size()[-1]
-        loss = self.criterion(step_logits.view(-1, C), dec_output_ids.view(-1).long())
-
+        seq_ids, weights, y_id = batch
+        logits, _ = self(seq_ids, weights)  # [B, output_vocab_size]
+        loss = self.criterion(logits, y_id.long())
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
+        # all logs are automatically stored for tensorboard
         return loss
 
     def validation_step(self, batch, batch_idx):
-        enc_input_ids, enc_input_pad_mask, \
-        dec_input_ids, \
-        dec_output_ids = batch
+        seq_ids, weights, y_id = batch
 
-        step_logits, _ = self(enc_input_ids, dec_input_ids, enc_input_pad_mask)
-        C = step_logits.size()[-1]
-        loss = self.criterion(step_logits.view(-1, C), dec_output_ids.view(-1).long())
+        logits, _ = self(seq_ids, weights)  # [B, output_vocab_size]
+        loss = self.criterion(logits, y_id.long())
 
         ## get predicted result
-        metrics = {'val_loss': loss}
+        prob = F.softmax(logits, dim=-1)
+        acc = FM.accuracy(prob, y_id)
+        metrics = {'val_acc': acc, 'val_loss': loss}
         self.log_dict(metrics)
         return metrics
 
     def validation_step_end(self, val_step_outputs):
+        val_acc = val_step_outputs['val_acc'].cpu()
         val_loss = val_step_outputs['val_loss'].cpu()
+
+        self.log('validation_acc', val_acc, prog_bar=True)
         self.log('validation_loss', val_loss, prog_bar=True)
 
     def test_step(self, batch, batch_idx):
-        enc_input_ids, enc_input_pad_mask, \
-        dec_input_ids, \
-        dec_output_ids, dec_output_pad_mask = batch
+        seq_ids, weights, y_id = batch
 
-        step_logits, _ = self(enc_input_ids, dec_input_ids, enc_input_pad_mask)
-        C = step_logits.size()[-1]
-        loss = self.criterion(step_logits.view(-1, C), dec_output_ids.view(-1).long())
+        logits, _ = self(seq_ids, weights)  # [B, output_vocab_size]
+        loss = self.criterion(logits, y_id.long())
 
-        step_probs = torch.softmax(step_logits, axis=-1)  # [B, tar_seq_len, num_output_vocab]
-        step_best_ids = torch.argmax(step_probs, axis=-1)
-
-        ## prediction
-        result = {}
-        result['input'] = enc_input_ids.cpu()
-        result['predicted'] = step_best_ids.cpu()
-        result['reference'] = dec_output_ids.cpu()
-        result['step_probs'] = step_probs.cpu()
-        return result
-
-    def set_vocabs(self, input_vocab, output_vocab):
-        self.input_vocab = input_vocab
-        self.output_vocab = output_vocab
-
-        self.r_input_vocab = {v: k for k, v in input_vocab.items()}
-        self.r_output_vocab = {v: k for k, v in output_vocab.items()}
-
-    def test_epoch_end(self, outputs):
-        input = result_collapse(outputs, 'input').cpu()
-        predicted = result_collapse(outputs, 'predicted').cpu()
-        reference = result_collapse(outputs, 'reference').cpu()
-        step_probs = result_collapse(outputs, 'step_probs').cpu()
-
-        def get_valid_items(tensor, pad_idx):
-            a = tensor.data.cpu().numpy()
-            a = a[a != pad_idx]
-            return a
-
-        import os
-        os.makedirs("./outputs", exist_ok=True)
-        with open('./outputs/sorted_result.txt', 'w') as f:
-            for _input, _pred, _ref, _prob in zip(input, predicted, reference, step_probs):
-                _input = get_valid_items(_input, self.hparams.enc_padding_idx)
-                _pred = get_valid_items(_pred, self.hparams.dec_padding_idx)
-                _ref = get_valid_items(_ref, self.hparams.dec_padding_idx)
-
-                ## trim _pred with first <end>
-                _N = -1
-                for idx, _i in enumerate(_pred):
-                    if _i == self.output_vocab['<end>']:
-                        _N = idx
-                        break
-                _pred = _pred[:_N]
-
-                input_seq = [self.r_input_vocab[x] for x in _input]
-                pred_seq = [self.r_output_vocab[x] for x in _pred]
-                ref_seq = [self.r_output_vocab[x] for x in _ref if self.output_vocab['<end>'] != x]
-
-                input_seq = ",".join(input_seq)
-                pred_seq = ",".join(pred_seq)
-                ref_seq = ",".join(ref_seq)
-
-                flag = 'O' if pred_seq == ref_seq else 'X'
-                print(f'[{flag}] {input_seq}', file=f)
-                print(f'\t\tREF  : {ref_seq}', file=f)
-                print(f'\t\tPRED : {pred_seq}', file=f)
-                print(f'-------------------', file=f)
+        ## get predicted result
+        prob = F.softmax(logits, dim=-1)
+        acc = FM.accuracy(prob, y_id)
+        metrics = {'test_acc': acc, 'test_loss': loss}
+        self.log_dict(metrics, on_epoch=True)
+        return metrics
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         return optimizer
 
     @staticmethod
-    def add_model_specific_args(parent_parser):
-        parser = parent_parser.add_argument_group("Transformer")
-        parser.add_argument('--learning_rate', type=float, default=0.0001)
+    def add_model_args(parent_parser: ArgumentParser):
+        parser = parent_parser.add_argument_group("IlluminaSequenceCorrector")
+        parser.add_argument('--d_model', type=int, default=512)
+        parser.add_argument('--num_heads', type=int, default=8)
+        parser.add_argument('--num_layers', type=int, default=4)
+        parser.add_argument("--learning_rate", type=float, default=1e-04)
         return parent_parser

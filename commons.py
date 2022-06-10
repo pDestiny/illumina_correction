@@ -51,7 +51,7 @@ def scaled_dot_product_attention(q: torch.Tensor,
     # so, in here we will apply dropout on scores
     if type(dropout) == float:
         attention_weights = F.dropout(attention_weights, dropout)
-    else:
+    elif type(dropout) == nn.Dropout:
         attention_weights = dropout(attention_weights)
 
     # blending
@@ -125,91 +125,3 @@ class Attention(nn.Module):
         # output : # [B, query_seq_len, d_model]
         # attention_weights : [B, num_heads, query_seq_len, key_seq_len]
         return output, attention_weights
-
-
-class TransformerEncoderLayer(nn.Module):
-    # - a single layer for Transformer-Encoder block
-    # - This Encoder block is almost identical to original transformer block
-    # - activation function is changed to RELU 
-    #       - (note that, recently RELU is frequently replaced as GELU)
-
-    def __init__(self, d_model, num_head, dim_feedforward, dropout=0.1):
-        super(TransformerEncoderLayer, self).__init__()
-        self.dropout = dropout
-
-        # self-attention
-        self.self_attn = Attention(d_model, num_head, dropout)
-
-        # MLP
-        self.act_fc = nn.GELU()  # <- I changed RELU to GELU
-        self.fc1 = nn.Linear(d_model, dim_feedforward)
-        self.fc2 = nn.Linear(dim_feedforward, d_model)
-
-        # LN for after attention and final 
-        self.self_attn_layer_norm = nn.LayerNorm(d_model)
-        self.final_layer_norm = nn.LayerNorm(d_model)
-
-    def forward(self, x, mask):
-        # 1) self-multihead-attention with add & norm 
-        residual = x
-        x, attn_scores = self.self_attn(query=x, key=x, value=x, mask=mask)
-        x = F.dropout(x, self.dropout, training=self.training)
-        x = residual + x
-        x = self.self_attn_layer_norm(x)  # POST Layer Normalization
-
-        # 2) MLP with add & norm
-        residual = x
-        x = self.act_fc(self.fc1(x))
-        x = F.dropout(x, self.dropout, training=self.training)
-        x = self.fc2(x)
-        x = F.dropout(x, self.dropout, training=self.training)
-        x = residual + x
-        x = self.final_layer_norm(x)  # POST Layer Normalization
-
-        # out : [batch_size, step_size=S, d_model]
-        return x, attn_scores
-
-
-import copy
-
-
-def clones(module, N):
-    "Produce N identical layers."
-    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
-
-
-class TransformerEncoder(nn.Module):
-    # Encoder Block - a stack of N layers
-    # Exactly same as TransformerEncoder 
-    def __init__(self, num_layers, d_model, num_heads, dropout, dim_feedforward=None):
-        super(TransformerEncoder, self).__init__()
-        self.num_layers = num_layers
-        if dim_feedforward == None: dim_feedforward = 4 * d_model  ## https://arxiv.org/pdf/1810.04805.pdf (page3)
-
-        a_layer = TransformerEncoderLayer(d_model, num_heads, dim_feedforward, dropout)
-
-        # prepare N sub-blocks
-        self.layers = clones(a_layer, self.num_layers)
-
-    def forward(self, x, mask=None):
-        # x expects : [B, seq_len, d_model] 
-        layers_attn_scores = []
-
-        "Pass the input (and mask) through each layer in turn."
-        for layer in self.layers:
-            x, attn_scores = layer(x, mask)
-            layers_attn_scores.append(attn_scores)
-        return x, layers_attn_scores
-
-
-def cp_weight(src, tar, copy_bias=True, include_eps=False):
-    assert tar.weight.size() == src.weight.size(), "Not compatible parameter size"
-    tar.load_state_dict(src.state_dict())
-
-    if include_eps:
-        # in case of LayerNorm. 
-        with torch.no_grad():
-            tar.eps = src.eps
-
-            ## call by reference
-    ## therefore, tar value is changed in this func.

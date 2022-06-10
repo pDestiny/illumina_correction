@@ -5,9 +5,11 @@ from argparse import ArgumentParser
 
 from pytorch_lightning.callbacks import EarlyStopping
 import pytorch_lightning as pl
-from decoder import InputEmbeddings, Transformer, result_collapse
-from model import Transformer_DNA_prediction
+from model import IlluminaSequenceCorrector
+from dataset import FastqDataModule, FastqPredictDataModule
+from voca import VOCA
 
+# TODO: main 함수 정리하기.
 def cli_main():
     pl.seed_everything(1234)
 
@@ -18,26 +20,20 @@ def cli_main():
     ## Good settings so far
     parser = ArgumentParser()
     parser.add_argument('--batch_size', default=200, type=int)
-    parser.add_argument('--d_model',    default=512, type=int)  # dim. for attention model -- 'H' at paper
-    parser.add_argument('--num_heads',  default=8,   type=int)  # number of heads  -- 'A' at paper
-    parser.add_argument('--num_layers', default=8,   type=int)  # number of layers -- 'L' at paper
-
     parser = pl.Trainer.add_argparse_args(parser)
-    parser = Transformer_DNA_prediction.add_model_specific_args(parser)
-    args = parser.parse_args()
-
     # ------------
     # data
     # ------------
-    dm = NumberDataModule.from_argparse_args(args)
+    dm = FastqDataModule.add_argparse_args(parser)
     x = iter(dm.train_dataloader()).next() # <for testing
 
     ## ------------
     ## model
     ## ------------
-    model = Transformer_Number_Sorting(
-                                    dm.input_vocab_size,
-                                    dm.output_vocab_size,
+
+    model = IlluminaSequenceCorrector(
+                                    input_voca_size=len(VOCA) - 1,
+                                    4,
                                     args.num_layers,    # number of layers
                                     args.d_model,       # dim. in attemtion mechanism
                                     args.num_heads,     # number of heads
